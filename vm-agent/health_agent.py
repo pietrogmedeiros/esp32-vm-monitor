@@ -258,6 +258,71 @@ def collect_systemd(watch, timeout):
 
 
 _HEALTH_RE = re.compile(r"\((healthy|unhealthy|health: starting)\)")
+_REPLICAS_RE = re.compile(r"^(\d+)\s*/\s*(\d+)")
+
+
+def collect_swarm(watch, timeout):
+    """Estado dos services do Docker Swarm.
+
+    Em Swarm (Easypanel, Portainer, etc) a fonte de verdade e `docker service
+    ls`, nao `docker ps`. Cada redeploy deixa para tras as tasks antigas em
+    estado 'exited'; conta-las como falha gera alarme falso para servicos que
+    estao perfeitamente de pe.
+
+    Devolve None se o daemon nao estiver em modo swarm.
+    """
+    out = run(["docker", "service", "ls", "--format", "{{json .}}"], timeout)
+    if out is None:
+        return None
+
+    services, bad = [], []
+    seen = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        name = raw.get("Name", "")
+        replicas = raw.get("Replicas", "")
+        match = _REPLICAS_RE.match(replicas)
+        if match:
+            running, desired = int(match.group(1)), int(match.group(2))
+        else:
+            running = desired = 0
+        seen.add(name)
+
+        if watch and name not in watch:
+            continue
+
+        # desired == 0 significa servico escalado para zero de proposito.
+        healthy = desired == 0 or running >= desired
+        entry = {
+            "name": name,
+            "image": raw.get("Image", ""),
+            "mode": raw.get("Mode", ""),
+            "replicas": replicas,
+            "running": running,
+            "desired": desired,
+            "ok": healthy,
+        }
+        services.append(entry)
+        if not healthy:
+            bad.append(name)
+
+    for name in watch:
+        if name not in seen:
+            services.append({
+                "name": name, "image": "", "mode": "", "replicas": "0/0",
+                "running": 0, "desired": 0, "ok": False,
+            })
+            bad.append(name)
+
+    return {"mode": "swarm", "total": len(services), "bad": bad,
+            "containers": services}
 
 
 def collect_docker(watch, timeout):
@@ -315,7 +380,16 @@ def collect_docker(watch, timeout):
             )
             bad.append(name)
 
-    return {"total": len(containers), "bad": bad, "containers": containers}
+    return {"mode": "standalone", "total": len(containers), "bad": bad,
+            "containers": containers}
+
+
+def collect_containers(watch, timeout):
+    """Swarm quando disponivel, senao containers avulsos."""
+    swarm = collect_swarm(watch, timeout)
+    if swarm is not None:
+        return swarm
+    return collect_docker(watch, timeout)
 
 
 # --------------------------------------------------------------------------
@@ -359,7 +433,7 @@ class Collector(threading.Thread):
         load = collect_load()
         uptime = collect_uptime()
         systemd = collect_systemd(cfg["watch_services"], timeout)
-        docker = collect_docker(cfg["watch_containers"], timeout)
+        docker = collect_containers(cfg["watch_containers"], timeout)
 
         problems = []
         # Serviços e containers derrubados são falha dura.

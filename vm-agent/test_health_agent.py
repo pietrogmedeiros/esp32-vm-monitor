@@ -101,6 +101,91 @@ class TestDocker(unittest.TestCase):
             self.assertIsNone(ha.collect_docker([], 5))
 
 
+SWARM_OUT = "\n".join(
+    json.dumps(s)
+    for s in [
+        {"Name": "gob_elasticsearch", "Image": "elasticsearch:8",
+         "Mode": "replicated", "Replicas": "1/1"},
+        {"Name": "gob_grafana", "Image": "grafana/grafana",
+         "Mode": "replicated", "Replicas": "1/1"},
+        {"Name": "gob_shipsafe", "Image": "meu/shipsafe",
+         "Mode": "replicated", "Replicas": "0/1"},
+        {"Name": "gob_aniversario_benicio", "Image": "meu/aniv",
+         "Mode": "replicated", "Replicas": "0/1"},
+        {"Name": "gob_desligado", "Image": "meu/x",
+         "Mode": "replicated", "Replicas": "0/0"},
+        {"Name": "gob_global", "Image": "node-exporter",
+         "Mode": "global", "Replicas": "2/2"},
+    ]
+)
+
+
+class TestSwarm(unittest.TestCase):
+    """Em Swarm, `docker ps -a` mente: tasks antigas ficam em 'exited' apos
+    cada redeploy. A verdade esta nas replicas de `docker service ls`."""
+
+    def collect(self, watch):
+        with mock.patch.object(ha, "run", return_value=SWARM_OUT):
+            return ha.collect_swarm(watch, 5)
+
+    def test_replicas_zero_de_um_e_falha(self):
+        res = self.collect([])
+        self.assertEqual(sorted(res["bad"]),
+                         ["gob_aniversario_benicio", "gob_shipsafe"])
+        self.assertEqual(res["mode"], "swarm")
+        self.assertEqual(res["total"], 6)
+
+    def test_servico_escalado_para_zero_nao_e_falha(self):
+        # 0/0 = desligado de proposito, nao quebrado.
+        entry = [c for c in self.collect([])["containers"]
+                 if c["name"] == "gob_desligado"][0]
+        self.assertTrue(entry["ok"])
+
+    def test_modo_global_conta_replicas(self):
+        entry = [c for c in self.collect([])["containers"]
+                 if c["name"] == "gob_global"][0]
+        self.assertTrue(entry["ok"])
+        self.assertEqual((entry["running"], entry["desired"]), (2, 2))
+
+    def test_tasks_antigas_nao_geram_falso_positivo(self):
+        # Este era o bug: 4 tasks 'exited' do elasticsearch viravam 4 falhas,
+        # mesmo com o servico rodando 1/1.
+        res = self.collect([])
+        self.assertNotIn("gob_elasticsearch", res["bad"])
+
+    def test_watchlist_filtra(self):
+        res = self.collect(["gob_grafana", "gob_shipsafe"])
+        self.assertEqual(res["bad"], ["gob_shipsafe"])
+        self.assertEqual(res["total"], 2)
+
+    def test_servico_ausente_da_watchlist_e_falha(self):
+        res = self.collect(["gob_fantasma"])
+        self.assertEqual(res["bad"], ["gob_fantasma"])
+
+    def test_replicas_ilegivel_nao_quebra(self):
+        weird = json.dumps({"Name": "x", "Replicas": "sei la", "Mode": "r"})
+        with mock.patch.object(ha, "run", return_value=weird):
+            res = ha.collect_swarm([], 5)
+        self.assertTrue(res["containers"][0]["ok"])  # desired=0 -> nao alarma
+
+    def test_fora_do_swarm_cai_para_docker_ps(self):
+        # `docker service ls` falha em daemon sem swarm; o agente deve usar
+        # `docker ps -a` sem ficar cego.
+        calls = []
+
+        def fake_run(cmd, timeout):
+            calls.append(cmd)
+            if "service" in cmd:
+                return None          # nao e swarm manager
+            return DOCKER_OUT
+
+        with mock.patch.object(ha, "run", side_effect=fake_run):
+            res = ha.collect_containers([], 5)
+        self.assertEqual(res["mode"], "standalone")
+        self.assertEqual(sorted(res["bad"]), ["batch", "redis"])
+        self.assertEqual(len(calls), 2)
+
+
 class TestStatus(unittest.TestCase):
     """Verifica a classificação ok / degraded / down."""
 
