@@ -1,0 +1,47 @@
+[Unit]
+Description=VM Health Agent (JSON de saude para o monitor ESP32)
+Documentation=https://github.com/local/esp32-vm-monitor
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=healthagent
+Group=healthagent
+# Necessario para 'docker ps'. Atencao: pertencer ao grupo docker equivale a
+# root na pratica; por isso o agente escuta apenas em 127.0.0.1 e o TLS +
+# autenticacao ficam a cargo do nginx.
+SupplementaryGroups=docker
+
+ExecStart=/usr/bin/python3 /opt/vm-health-agent/health_agent.py
+Environment=HEALTH_AGENT_CONFIG=/etc/vm-health-agent/config.json
+Environment=PYTHONUNBUFFERED=1
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# --- Hardening ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+ReadOnlyPaths=/opt/vm-health-agent /etc/vm-health-agent
+
+# Limites de recurso — o agente e minusculo, nao deve crescer.
+MemoryMax=128M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

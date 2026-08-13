@@ -1,0 +1,67 @@
+# Publica o vm-health-agent na internet com TLS.
+#
+#   1. sudo cp nginx.conf.example /etc/nginx/sites-available/health
+#   2. troque SEU-DOMINIO.com pelo seu dominio real
+#   3. sudo ln -s /etc/nginx/sites-available/health /etc/nginx/sites-enabled/
+#   4. sudo certbot --nginx -d SEU-DOMINIO.com     (emite o certificado)
+#   5. sudo nginx -t && sudo systemctl reload nginx
+#
+# O ESP32 vai chamar:  https://SEU-DOMINIO.com/health/summary
+#
+# IMPORTANTE: a diretiva limit_req_zone abaixo so vale dentro do bloco http{}.
+# Coloque esta linha em /etc/nginx/nginx.conf (dentro de http{ ... }):
+#
+#     limit_req_zone $binary_remote_addr zone=health:1m rate=30r/m;
+#
+# ou salve-a em /etc/nginx/conf.d/health-limit.conf, que ja e incluido no http{}.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name SEU-DOMINIO.com;
+    # O certbot reescreve este bloco para redirecionar 80 -> 443.
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name SEU-DOMINIO.com;
+
+    # Preenchido pelo certbot:
+    # ssl_certificate     /etc/letsencrypt/live/SEU-DOMINIO.com/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/SEU-DOMINIO.com/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    # O ESP32 tem pouca RAM: o handshake fica mais leve sem OCSP stapling
+    # e com sessoes reaproveitaveis.
+    ssl_session_cache shared:SSL:2m;
+    ssl_session_timeout 1h;
+
+    access_log /var/log/nginx/health.access.log;
+    error_log  /var/log/nginx/health.error.log;
+
+    location /health {
+        # Freio contra forca bruta no token (zona declarada no http{}).
+        limit_req zone=health burst=10 nodelay;
+
+        proxy_pass http://127.0.0.1:9099;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # Repassa o Bearer token do ESP32 para o agente.
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 15s;
+        proxy_connect_timeout 5s;
+    }
+
+    location /ping {
+        proxy_pass http://127.0.0.1:9099;
+        proxy_set_header Host $host;
+    }
+
+    location / { return 404; }
+}

@@ -1,0 +1,9 @@
+# Segredos: senha do Wi-Fi e token da VM
+firmware/include/monitor_config.h
+vm-agent/config.json
+
+# Build do PlatformIO
+firmware/.pio/
+.vscode/
+__pycache__/
+*.pyc

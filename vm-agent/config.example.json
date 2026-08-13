@@ -1,0 +1,28 @@
+{
+  "bind": "127.0.0.1",
+  "port": 9099,
+  "token": "TROQUE-ME-por-um-token-longo-e-aleatorio",
+  "hostname_override": null,
+
+  "_comment_services": "Vazio = reporta apenas units em estado failed. Preenchido = essas units viram a lista crítica.",
+  "watch_services": [
+    "docker.service",
+    "nginx.service",
+    "ssh.service"
+  ],
+
+  "_comment_containers": "Vazio = observa todos os containers existentes. Preenchido = esses containers precisam existir e estar rodando.",
+  "watch_containers": [],
+
+  "watch_disks": ["/"],
+
+  "thresholds": {
+    "cpu_pct": 90.0,
+    "mem_pct": 90.0,
+    "disk_pct": 85.0,
+    "load_per_core": 2.0
+  },
+
+  "collect_interval_s": 10,
+  "subprocess_timeout_s": 8
+}
