@@ -100,7 +100,47 @@ cada consulta.
 
 ## Parte 1 — Instalar o agente na VM
 
-Copie a pasta `vm-agent/` para a VM e rode o instalador:
+### Opção A — Container (Easypanel, Portainer, Docker Swarm)
+
+Não precisa de SSH. No Easypanel, crie um serviço do tipo **Aplicativo**:
+
+| Campo | Valor |
+|---|---|
+| Fonte → Git | `https://github.com/pietrogmedeiros/esp32-vm-monitor.git` |
+| Ramo | `main` |
+| Caminho de Build | `/vm-agent` |
+| Construção | Dockerfile → `Dockerfile` |
+| Armazenamento → Bind Mount | `/var/run/docker.sock` → `/var/run/docker.sock` |
+| Domínios | seu host, porta de destino **9099** |
+| Ambiente | `HEALTH_TOKEN=...` e `HEALTH_HOSTNAME=seu-dominio` |
+
+Gere o token com:
+
+```bash
+python3 -c 'import secrets;print(secrets.token_urlsafe(32))'
+```
+
+`HEALTH_HOSTNAME` importa: dentro de um container o hostname é o ID gerado
+pelo Docker (`0afc4df8dd7e`), e é esse texto que vira o título na tela.
+
+**Em Swarm, o agente usa `docker service ls`, não `docker ps`.** Cada redeploy
+deixa as tasks antigas em `exited`; contá-las como falha gera alarme falso.
+No primeiro deploy real isso apareceu na hora: 24 de 38 containers
+"caídos" enquanto o painel mostrava tudo verde.
+
+Serviços em `0/0` (parados de propósito — a bolinha vermelha do Easypanel)
+são reportados como **aviso**, não como queda. Para mudar, use
+`stopped_services` no config: `failure`, `warning` (padrão) ou `ignore`.
+
+O container não enxerga o systemd do host — num servidor gerenciado por
+Easypanel isso não importa, porque os serviços são todos containers.
+CPU e memória saem corretos sem montagem extra, porque `/proc/stat` e
+`/proc/meminfo` não são isolados por namespace.
+
+### Opção B — Direto no host (systemd)
+
+Dá visão também do systemd. Copie a pasta `vm-agent/` para a VM e rode o
+instalador:
 
 ```bash
 scp -r vm-agent/ usuario@sua-vm:/tmp/
@@ -190,7 +230,20 @@ precisa de TTY):
 pio device monitor -p /dev/cu.usbserial-110 -b 115200
 ```
 
-Se o certificado da VM **não** for Let's Encrypt:
+### Certificados
+
+`firmware/include/ca_cert.h` traz **duas** raízes concatenadas: `ISRG Root X1`
+e `ISRG Root YR`. Certificados novos da Let's Encrypt encadeiam por
+
+```
+folha  ←  Let's Encrypt YR2  ←  ISRG Root YR  ←  ISRG Root X1
+```
+
+Só a X1 funcionaria hoje pelo elo cruzado, mas quebraria se a Let's Encrypt
+parasse de servi-lo. O mbedTLS do ESP32 aceita um bundle e escolhe a raiz que
+fecha a cadeia apresentada.
+
+Se o certificado da VM não for Let's Encrypt:
 
 ```bash
 ./scripts/gerar-ca.sh SEU-DOMINIO.com    # regenera firmware/include/ca_cert.h
@@ -253,7 +306,8 @@ esp32/
 │   ├── vm-health-agent.service     unit systemd com hardening
 │   ├── nginx.conf.example          TLS + rate limit
 │   ├── config.example.json
-│   ├── test_health_agent.py        21 testes dos parsers
+│   ├── Dockerfile                  deploy como container
+│   ├── test_health_agent.py        34 testes dos parsers
 │   └── test_contract.py            6 testes agente ↔ firmware
 └── scripts/
     ├── detectar-esp32.sh           diagnostica a porta serial no macOS
