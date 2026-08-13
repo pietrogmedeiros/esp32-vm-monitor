@@ -71,6 +71,11 @@ def load_config():
     env_token = os.environ.get("HEALTH_TOKEN")
     if env_token:
         cfg["token"] = env_token
+    # Num container, socket.gethostname() devolve o ID gerado pelo Docker
+    # ("0afc4df8dd7e"), que é o que acaba virando título na tela do ESP32.
+    env_host = os.environ.get("HEALTH_HOSTNAME")
+    if env_host:
+        cfg["hostname_override"] = env_host
     return cfg
 
 
