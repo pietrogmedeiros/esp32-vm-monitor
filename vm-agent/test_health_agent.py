@@ -241,6 +241,14 @@ class TestServiceLogs(unittest.TestCase):
     def test_marca_o_horario_do_ultimo_erro(self):
         self.assertEqual(self.collect()["last_error_at"], "00:11:02")
 
+    def test_guarda_as_ultimas_linhas_de_qualquer_nivel(self):
+        # Serve para a tela nunca ficar vazia: sem isto, "nenhuma anomalia" e
+        # "detector cego" ficariam indistinguiveis para quem olha o painel.
+        tail = self.collect()["tail"]
+        self.assertLessEqual(len(tail), 4)
+        self.assertIn("failed to find cache", tail[0]["m"])  # a mais recente
+        self.assertTrue(all(t["lvl"] == "info" for t in tail))
+
     def test_le_o_stderr_do_container(self):
         # Regressao: usar run() em vez de run_merged() perderia as exceptions,
         # que saem no stderr da aplicacao.
@@ -380,6 +388,24 @@ class TestFocusSummary(unittest.TestCase):
         res = self.build(self.HEALTHY_LOGS, self.HEALTHY_TASKS,
                          replicas="0/1", ok=False)
         self.assertEqual(res["status"], "down")
+
+    def test_sem_anomalia_manda_as_ultimas_linhas(self):
+        logs = {"scanned": 500, "errors": 0, "warnings": 0, "last_error_at": "",
+                "recent": [],
+                "tail": [{"t": "00:30:00", "lvl": "info", "m": "GET /health 200"}]}
+        s = ha.summarize_focus(self.build(logs, self.HEALTHY_TASKS))
+        self.assertEqual(len(s["msgs"]), 1)
+        self.assertIn("GET /health 200", s["msgs"][0]["m"])
+        self.assertEqual(s["msgs"][0]["l"], "info")
+
+    def test_anomalia_tem_prioridade_sobre_as_ultimas_linhas(self):
+        logs = {"scanned": 500, "errors": 1, "warnings": 0,
+                "last_error_at": "00:31:00",
+                "recent": [{"t": "00:31:00", "lvl": "err", "m": "ERROR falhou"}],
+                "tail": [{"t": "00:32:00", "lvl": "info", "m": "GET /health 200"}]}
+        s = ha.summarize_focus(self.build(logs, self.HEALTHY_TASKS))
+        self.assertEqual(len(s["msgs"]), 1)
+        self.assertIn("ERROR falhou", s["msgs"][0]["m"])
 
     def test_resumo_cabe_na_tela_do_esp32(self):
         logs = {"scanned": 300, "errors": 5, "warnings": 9,

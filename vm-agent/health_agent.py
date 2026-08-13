@@ -488,6 +488,7 @@ def collect_service_logs(name, cfg, timeout, swarm=True):
 
     errors, warns, scanned = 0, 0, 0
     recent = []
+    tail = []
     last_error_at = ""
 
     for raw in out.splitlines():
@@ -508,8 +509,16 @@ def collect_service_logs(name, cfg, timeout, swarm=True):
             warns += 1
             recent.append({"t": stamp, "lvl": "warn", "m": message[:120]})
 
+        # Guarda as últimas linhas de qualquer nível. Sem isto, um serviço sem
+        # anomalias mostraria uma tela vazia — e tela vazia não distingue
+        # "está tudo bem" de "meu detector está cego".
+        tail.append({"t": stamp, "lvl": "info", "m": message[:120]})
+        if len(tail) > 4:
+            tail.pop(0)
+
     # As mais novas primeiro: é o que interessa numa tela pequena.
     recent.reverse()
+    tail.reverse()
 
     return {
         "scanned": scanned,
@@ -517,6 +526,7 @@ def collect_service_logs(name, cfg, timeout, swarm=True):
         "warnings": warns,
         "last_error_at": last_error_at,
         "recent": recent[:12],
+        "tail": tail,
     }
 
 
@@ -730,7 +740,9 @@ def summarize_focus(entry):
     """
     logs = entry.get("logs") or {}
     tasks = entry.get("tasks") or {}
-    recent = logs.get("recent", [])[:4]
+    # Sem anomalia, manda as últimas linhas: a tela mostra que o serviço está
+    # vivo e logando, em vez de um vazio ambíguo.
+    recent = logs.get("recent", [])[:4] or logs.get("tail", [])[:4]
     return {
         "name": entry.get("name", "")[:28],
         "st": entry.get("status", "unknown"),

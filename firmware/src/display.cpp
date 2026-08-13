@@ -278,9 +278,13 @@ static void drawFocus(const MonitorState &s) {
   // Últimas anomalias — o miolo desta tela.
   const int16_t listY = METRIC_Y + METRIC_H - 6;
   tft.fillRect(0, listY, SCR_W, FOOT_Y - listY, COL_BG);
+  // Sem anomalia, o agente manda as últimas linhas comuns. O título muda para
+  // deixar claro o que se está olhando — senão log rotineiro pareceria alerta.
+  const bool anomalias = f.errors > 0 || f.warnings > 0;
   tft.setTextColor(COL_MUTED, COL_BG);
-  tft.drawString(f.lineCount > 0 ? "ULTIMAS ANOMALIAS"
-                                 : "Nenhuma anomalia no log recente",
+  tft.drawString(f.lineCount == 0 ? "Sem logs recentes"
+                 : anomalias      ? "ULTIMAS ANOMALIAS"
+                                  : "LOG RECENTE (sem anomalias)",
                  PAD, listY, 2);
 
   for (int i = 0; i < f.lineCount && i < 4; i++) {
@@ -290,7 +294,10 @@ static void drawFocus(const MonitorState &s) {
     // O horário fica cinza para o olho ir direto à mensagem.
     tft.setTextColor(COL_MUTED, COL_BG);
     tft.drawString(line.time.substring(0, 5), PAD, y, 2);
-    tft.setTextColor(line.level == "err" ? COL_ALERT : COL_WARN, COL_BG);
+    uint16_t color = line.level == "err"    ? COL_ALERT
+                     : line.level == "warn" ? COL_WARN
+                                            : COL_MUTED;
+    tft.setTextColor(color, COL_BG);
     tft.drawString(truncate(line.text, 34), PAD + 42, y, 2);
   }
 
