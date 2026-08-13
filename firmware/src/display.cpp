@@ -71,6 +71,7 @@ static const int16_t PAD = 8;
 
 struct Cache {
   bool primed = false;
+  Screen screen = SCREEN_OVERVIEW;
   Status status = ST_BOOT;
   String host;
   String stale;
@@ -78,6 +79,7 @@ struct Cache {
   int svcBad = -1, svcTotal = -1, dkrBad = -1, dkrTotal = -1;
   String problems;
   String footer;
+  String focusSig;
 };
 
 static Cache cache;
@@ -232,6 +234,74 @@ static void drawFooter(const MonitorState &s, const String &text) {
 }
 
 // --------------------------------------------------------------------------
+// Tela 2 — detalhe de um serviço
+// --------------------------------------------------------------------------
+
+static void drawFocus(const MonitorState &s) {
+  const Focus &f = s.focus;
+  uint16_t color = statusColor(f.valid ? f.status : ST_FETCH_ERR);
+
+  // Cabeçalho: nome do serviço e réplicas.
+  tft.fillRect(0, HEADER_Y, SCR_W, HEADER_H, color);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(COL_TEXT, color);
+  tft.drawString(truncate(String(f.name), 30), PAD, HEADER_Y + 3, 2);
+  tft.drawString(statusName(f.valid ? f.status : ST_FETCH_ERR), PAD,
+                 HEADER_Y + 20, 4);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(String(f.replicas), SCR_W - PAD, HEADER_Y + 18, 4);
+  tft.setTextDatum(TL_DATUM);
+
+  if (!f.valid) {
+    tft.fillRect(0, METRIC_Y, SCR_W, SCR_H - METRIC_Y - FOOT_H, COL_BG);
+    tft.setTextColor(COL_MUTED, COL_BG);
+    tft.drawString("sem dados deste servico", PAD, METRIC_Y + 20, 2);
+    return;
+  }
+
+  // Contadores: erros, avisos e reinícios de task.
+  tft.fillRect(0, METRIC_Y, SCR_W, METRIC_H - 12, COL_BG);
+  const char *labels[3] = {"ERROS", "AVISOS", "REINICIOS"};
+  const int values[3] = {f.errors, f.warnings, f.failedTasks};
+  const uint16_t colors[3] = {f.errors > 0 ? COL_ALERT : COL_TEXT,
+                              f.warnings > 0 ? COL_WARN : COL_TEXT,
+                              f.failedTasks > 0 ? COL_ALERT : COL_TEXT};
+  const int16_t colW = (SCR_W - PAD * 2) / 3;
+  for (int i = 0; i < 3; i++) {
+    int16_t x = PAD + i * colW;
+    tft.setTextColor(COL_MUTED, COL_BG);
+    tft.drawString(labels[i], x, METRIC_Y, 2);
+    tft.setTextColor(colors[i], COL_BG);
+    tft.drawString(String(values[i]), x, METRIC_Y + 18, 4);
+  }
+
+  // Últimas anomalias — o miolo desta tela.
+  const int16_t listY = METRIC_Y + METRIC_H - 6;
+  tft.fillRect(0, listY, SCR_W, FOOT_Y - listY, COL_BG);
+  tft.setTextColor(COL_MUTED, COL_BG);
+  tft.drawString(f.lineCount > 0 ? "ULTIMAS ANOMALIAS"
+                                 : "Nenhuma anomalia no log recente",
+                 PAD, listY, 2);
+
+  for (int i = 0; i < f.lineCount && i < 4; i++) {
+    int16_t y = listY + 18 + i * 17;
+    if (y + 16 > FOOT_Y) break;
+    const LogLine &line = f.lines[i];
+    // O horário fica cinza para o olho ir direto à mensagem.
+    tft.setTextColor(COL_MUTED, COL_BG);
+    tft.drawString(line.time.substring(0, 5), PAD, y, 2);
+    tft.setTextColor(line.level == "err" ? COL_ALERT : COL_WARN, COL_BG);
+    tft.drawString(truncate(line.text, 34), PAD + 42, y, 2);
+  }
+
+  // Rodapé com o tamanho da janela analisada.
+  String foot = String(f.scanned) + " linhas";
+  if (f.lastErrorAt.length()) foot += "  ultimo erro " + f.lastErrorAt;
+  foot += "  " + String(f.runningTasks) + " task";
+  drawFooter(s, foot);
+}
+
+// --------------------------------------------------------------------------
 // API
 // --------------------------------------------------------------------------
 
@@ -263,16 +333,45 @@ void displayBootMessage(const char *line) {
   tft.drawString(truncate(String(line), 40), PAD, PAD + 58, 2);
 }
 
+// Zera o cache para que a proxima renderizacao repinte tudo.
+static void invalidateCache() {
+  cache.status = ST_BOOT;
+  cache.host = "\x01";
+  cache.stale = "\x01";
+  cache.cpu = cache.mem = cache.disk = -1;
+  cache.svcBad = cache.svcTotal = cache.dkrBad = cache.dkrTotal = -1;
+  cache.problems = "\x01";
+  cache.footer = "\x01";
+  cache.focusSig = "\x01";
+}
+
 void displayRender(const MonitorState &s) {
   // A primeira renderizacao limpa a tela de boot inteira.
   if (!cache.primed) {
     tft.fillScreen(COL_BG);
     cache.primed = true;
-    cache.status = ST_BOOT;
-    cache.host = "";
-    cache.stale = "\x01";  // forca o primeiro desenho
-    cache.problems = "\x01";
-    cache.footer = "\x01";
+    invalidateCache();
+  }
+
+  // Trocar de painel exige repintura completa: as secoes nao se sobrepoem.
+  if (s.screen != cache.screen) {
+    tft.fillScreen(COL_BG);
+    cache.screen = s.screen;
+    invalidateCache();
+  }
+
+  if (s.screen == SCREEN_FOCUS) {
+    const Focus &f = s.focus;
+    String sig = String(f.valid) + "|" + f.name + "|" + f.replicas + "|" +
+                 String((int)f.status) + "|" + String(f.errors) + "|" +
+                 String(f.warnings) + "|" + String(f.failedTasks) + "|" +
+                 String(f.scanned) + "|" + f.lastErrorAt + "|";
+    for (int i = 0; i < f.lineCount; i++) sig += f.lines[i].text + ";";
+    if (sig != cache.focusSig) {
+      drawFocus(s);
+      cache.focusSig = sig;
+    }
+    return;
   }
 
   String host = s.health.valid ? String(s.health.host) : String("");

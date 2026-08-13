@@ -4,6 +4,7 @@
     python3 test_health_agent.py
 """
 import json
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -193,6 +194,145 @@ class TestSwarm(unittest.TestCase):
         self.assertEqual(res["mode"], "standalone")
         self.assertEqual(sorted(res["bad"]), ["batch", "redis"])
         self.assertEqual(len(calls), 2)
+
+
+LOGS_OUT = "\n".join([
+    "2026-08-13T00:10:01.123456789Z lemon-meet_backend.1.abc123 | INFO servidor ouvindo em :3000",
+    "2026-08-13T00:10:05.000000000Z lemon-meet_backend.1.abc123 | WARN deprecated api /v1/rooms",
+    "2026-08-13T00:11:02.000000000Z lemon-meet_backend.1.abc123 | ERROR ECONNREFUSED postgres:5432",
+    "2026-08-13T00:11:02.100000000Z lemon-meet_backend.1.abc123 | Traceback (most recent call last):",
+    "2026-08-13T00:12:30.000000000Z lemon-meet_backend.1.abc123 | INFO reconectado ao banco",
+    "",
+    "2026-08-13T00:13:00.000000000Z lemon-meet_backend.1.abc123 | info: failed to find cache, building fresh",
+])
+
+
+class TestServiceLogs(unittest.TestCase):
+    CFG = {"focus_log_lines": 300, "error_pattern": "", "warn_pattern": ""}
+
+    def collect(self):
+        with mock.patch.object(ha, "run_merged", return_value=LOGS_OUT):
+            return ha.collect_service_logs("lemon-meet_backend", self.CFG, 5)
+
+    def test_conta_erros_e_avisos(self):
+        res = self.collect()
+        self.assertEqual(res["errors"], 2)    # ECONNREFUSED + Traceback
+        self.assertEqual(res["warnings"], 1)  # deprecated
+        self.assertEqual(res["scanned"], 6)   # linha vazia nao conta
+
+    def test_failed_generico_nao_vira_erro(self):
+        # "failed to find cache, building fresh" e log saudavel. Se contasse,
+        # afogaria o sinal numa tela de 3 linhas.
+        res = self.collect()
+        textos = " ".join(m["m"] for m in res["recent"])
+        self.assertNotIn("failed to find cache", textos)
+
+    def test_remove_carimbo_e_prefixo_da_task(self):
+        primeiro = self.collect()["recent"][0]
+        self.assertNotIn("lemon-meet_backend.1.", primeiro["m"])
+        self.assertNotIn("2026-08-13T", primeiro["m"])
+        self.assertRegex(primeiro["t"], r"^\d{2}:\d{2}:\d{2}$")
+
+    def test_mais_recentes_primeiro(self):
+        recent = self.collect()["recent"]
+        self.assertIn("Traceback", recent[0]["m"])
+        self.assertIn("deprecated", recent[-1]["m"])
+
+    def test_marca_o_horario_do_ultimo_erro(self):
+        self.assertEqual(self.collect()["last_error_at"], "00:11:02")
+
+    def test_le_o_stderr_do_container(self):
+        # Regressao: usar run() em vez de run_merged() perderia as exceptions,
+        # que saem no stderr da aplicacao.
+        with mock.patch.object(ha, "run_merged", return_value=LOGS_OUT) as merged:
+            ha.collect_service_logs("x", self.CFG, 5)
+        merged.assert_called_once()
+        self.assertIn("--timestamps", merged.call_args[0][0])
+
+    def test_docker_sem_logs_nao_quebra(self):
+        with mock.patch.object(ha, "run_merged", return_value=None):
+            self.assertIsNone(ha.collect_service_logs("x", self.CFG, 5))
+
+    def test_erro_do_cli_nao_vira_anomalia_da_aplicacao(self):
+        # Com stderr mesclado, "Error: no such service" chegaria como se fosse
+        # log da aplicacao e seria contado como erro dela. O codigo de saida
+        # e o unico sinal confiavel.
+        falha = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="Error response from daemon: no such service: xyz\n")
+        with mock.patch.object(subprocess, "run", return_value=falha):
+            self.assertIsNone(ha.run_merged(["docker", "service", "logs"], 5))
+
+    def test_saida_valida_com_codigo_zero_passa(self):
+        okproc = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="linha de log\n")
+        with mock.patch.object(subprocess, "run", return_value=okproc):
+            self.assertEqual(ha.run_merged(["docker"], 5), "linha de log\n")
+
+    def test_regex_customizada(self):
+        cfg = dict(self.CFG, error_pattern=r"(?i)\bdeprecated\b")
+        with mock.patch.object(ha, "run_merged", return_value=LOGS_OUT):
+            res = ha.collect_service_logs("x", cfg, 5)
+        self.assertEqual(res["errors"], 1)
+
+
+TASKS_OUT = "\n".join(json.dumps(t) for t in [
+    {"CurrentState": "Running 3 hours ago", "Error": ""},
+    {"CurrentState": "Shutdown 2 days ago", "Error": ""},
+    {"CurrentState": "Failed 2 days ago", "Error": "task: non-zero exit (1)"},
+])
+
+
+class TestServiceTasks(unittest.TestCase):
+    def test_conta_reinicios_e_guarda_o_erro(self):
+        with mock.patch.object(ha, "run", return_value=TASKS_OUT):
+            res = ha.collect_service_tasks("lemon-meet_backend", 5)
+        self.assertEqual(res["running_tasks"], 1)
+        self.assertEqual(res["failed_tasks"], 1)
+        self.assertIn("non-zero exit", res["last_task_error"])
+
+
+class TestFocusSummary(unittest.TestCase):
+    def build(self, logs, tasks, replicas="1/1", ok=True):
+        docker = {"mode": "swarm", "containers": [
+            {"name": "lemon-meet_backend", "replicas": replicas, "ok": ok}]}
+        with mock.patch.object(ha, "collect_service_logs", return_value=logs), \
+             mock.patch.object(ha, "collect_service_tasks", return_value=tasks):
+            return ha.collect_focus("lemon-meet_backend", {}, 5, docker)
+
+    HEALTHY_LOGS = {"scanned": 100, "errors": 0, "warnings": 2,
+                    "last_error_at": "", "recent": []}
+    HEALTHY_TASKS = {"running_tasks": 1, "failed_tasks": 0,
+                     "last_task_error": ""}
+
+    def test_servico_de_pe_sem_erros_e_ok(self):
+        res = self.build(self.HEALTHY_LOGS, self.HEALTHY_TASKS)
+        self.assertEqual(res["status"], "ok")
+
+    def test_erro_no_log_degrada_mesmo_com_replica_de_pe(self):
+        logs = dict(self.HEALTHY_LOGS, errors=3)
+        res = self.build(logs, self.HEALTHY_TASKS)
+        self.assertEqual(res["status"], "degraded")
+
+    def test_task_falha_degrada(self):
+        tasks = dict(self.HEALTHY_TASKS, failed_tasks=2)
+        res = self.build(self.HEALTHY_LOGS, tasks)
+        self.assertEqual(res["status"], "degraded")
+
+    def test_replica_fora_derruba(self):
+        res = self.build(self.HEALTHY_LOGS, self.HEALTHY_TASKS,
+                         replicas="0/1", ok=False)
+        self.assertEqual(res["status"], "down")
+
+    def test_resumo_cabe_na_tela_do_esp32(self):
+        logs = {"scanned": 300, "errors": 5, "warnings": 9,
+                "last_error_at": "00:11:02",
+                "recent": [{"t": "00:11:02", "lvl": "err", "m": "x" * 200}] * 10}
+        s = ha.summarize_focus(self.build(logs, self.HEALTHY_TASKS))
+        self.assertEqual(len(s["msgs"]), 4)          # so as 4 mais recentes
+        self.assertLessEqual(len(s["msgs"][0]["m"]), 64)
+        size = len(json.dumps(s))
+        self.assertLess(size, 700, f"payload grande demais: {size}B")
 
 
 class TestStatus(unittest.TestCase):

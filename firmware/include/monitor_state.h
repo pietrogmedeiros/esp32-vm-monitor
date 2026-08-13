@@ -46,6 +46,32 @@ struct Health {
   int badCount = 0;
 };
 
+// Uma linha de anomalia vinda do log do serviço em foco.
+struct LogLine {
+  String time;   // "00:11:02"
+  String level;  // "err" | "warn"
+  String text;
+};
+
+// Segunda tela: detalhe de um único serviço.
+struct Focus {
+  bool valid = false;
+  char name[30] = "";
+  char replicas[12] = "";
+  Status status = ST_BOOT;
+  int errors = 0, warnings = 0, scanned = 0;
+  int runningTasks = 0, failedTasks = 0;
+  String lastErrorAt;
+  LogLine lines[4];
+  int lineCount = 0;
+};
+
+// Qual painel está no ar.
+enum Screen : uint8_t {
+  SCREEN_OVERVIEW,
+  SCREEN_FOCUS,
+};
+
 // Tudo que a tela precisa saber para se desenhar.
 struct MonitorState {
   Status status = ST_BOOT;
@@ -56,4 +82,6 @@ struct MonitorState {
   uint32_t polls = 0;
   uint32_t failures = 0;
   bool wifiUp = false;
+  Focus focus;
+  Screen screen = SCREEN_OVERVIEW;
 };

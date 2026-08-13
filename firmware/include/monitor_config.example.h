@@ -35,6 +35,22 @@
 #define HTTP_TIMEOUT_MS         10000
 
 // ---------------------------------------------------------------------------
+// Segunda tela: um servico especifico (logs e anomalias)
+// ---------------------------------------------------------------------------
+// A placa alterna entre o painel geral e o detalhe deste servico. Um toque na
+// tela troca na hora. Coloque 0 em ENABLE_FOCUS_SCREEN para ter so o geral —
+// nesse caso o toque volta a forcar uma atualizacao imediata.
+#define ENABLE_FOCUS_SCREEN 1
+
+// Sem ?name=, o agente devolve o primeiro de focus_services. Para escolher:
+//   ".../service/summary?name=lemon-meet_backend"
+// O nome precisa estar em focus_services na VM (e uma whitelist).
+#define FOCUS_URL       "https://SEU-DOMINIO.com/service/summary"
+
+// Quanto tempo cada painel fica no ar antes de alternar (ms).
+#define SCREEN_SWITCH_MS 10000UL
+
+// ---------------------------------------------------------------------------
 // TLS
 // ---------------------------------------------------------------------------
 // 1 = valida o certificado do servidor contra include/ca_cert.h (recomendado).

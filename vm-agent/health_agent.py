@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote_plus
 
 CONFIG_PATHS = [
     os.environ.get("HEALTH_AGENT_CONFIG", ""),
@@ -44,6 +45,14 @@ DEFAULTS = {
     # Easypanel e a bolinha vermelha). "failure" derruba o status, "warning"
     # degrada, "ignore" nao reporta.
     "stopped_services": "warning",
+    # Serviços com tela dedicada no ESP32 (logs + anomalias). Funciona como
+    # whitelist: o endpoint /service só aceita nomes que estejam aqui, para
+    # que um token vazado não vire leitura arbitrária de log.
+    "focus_services": [],
+    "focus_log_lines": 300,
+    # Regex customizáveis; vazio usa DEFAULT_ERROR_RE / DEFAULT_WARN_RE.
+    "error_pattern": "",
+    "warn_pattern": "",
     "thresholds": {
         "cpu_pct": 90.0,
         "mem_pct": 90.0,
@@ -76,6 +85,10 @@ def load_config():
     env_host = os.environ.get("HEALTH_HOSTNAME")
     if env_host:
         cfg["hostname_override"] = env_host
+    env_focus = os.environ.get("HEALTH_FOCUS_SERVICES")
+    if env_focus:
+        cfg["focus_services"] = [s.strip() for s in env_focus.split(",")
+                                 if s.strip()]
     return cfg
 
 
@@ -92,6 +105,33 @@ def run(cmd, timeout):
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0 and not proc.stdout.strip():
+        return None
+    return proc.stdout
+
+
+def run_merged(cmd, timeout):
+    """Como run(), mas junta stderr ao stdout.
+
+    Necessário para logs: `docker logs` reproduz os fluxos do container, e o
+    stderr da aplicação sai no stderr do CLI. É justamente lá que ficam as
+    exceptions — ler só o stdout perderia quase toda anomalia.
+    """
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Aqui o código de saída é o único sinal confiável. Com o stderr mesclado,
+    # a mensagem de falha do próprio CLI ("Error: no such service") viria como
+    # se fosse log da aplicação — e seria contada como anomalia dela.
+    if proc.returncode != 0:
         return None
     return proc.stdout
 
@@ -398,6 +438,138 @@ def collect_docker(watch, timeout):
             "stopped": [], "containers": containers}
 
 
+# Duas camadas: 'error' pega falha de verdade, 'warn' pega ruído que merece
+# atenção. Palavras genéricas como "failed" ficam de fora de propósito — elas
+# aparecem em log saudável ("failed to find cache, building") e afogariam o
+# sinal numa tela de 3 linhas.
+DEFAULT_ERROR_RE = (
+    r"(?i)(\bERROR\b|\bFATAL\b|\bCRITICAL\b|\bPANIC\b|\bException\b|"
+    r"\bTraceback\b|\bECONNREFUSED\b|\bUnhandled\b|\bsegfault\b)"
+)
+DEFAULT_WARN_RE = r"(?i)(\bWARN\b|\bWARNING\b|\bdeprecated\b|\bretrying\b)"
+
+# Prefixo ISO que o --timestamps do docker coloca em cada linha.
+_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})\S*\s+(.*)$")
+
+
+def _strip_timestamp(line):
+    """Separa o carimbo do docker do texto. Devolve (hh:mm:ss, mensagem)."""
+    match = _TS_RE.match(line)
+    if match:
+        return match.group(2), match.group(3)
+    return "", line
+
+
+def collect_service_logs(name, cfg, timeout, swarm=True):
+    """Conta anomalias nas últimas linhas de log de um serviço."""
+    tail = str(cfg.get("focus_log_lines", 300))
+    cmd = (["docker", "service", "logs", name] if swarm
+           else ["docker", "logs", name])
+    cmd += ["--tail", tail, "--timestamps"]
+
+    out = run_merged(cmd, timeout)
+    if out is None:
+        return None
+
+    error_re = re.compile(cfg.get("error_pattern") or DEFAULT_ERROR_RE)
+    warn_re = re.compile(cfg.get("warn_pattern") or DEFAULT_WARN_RE)
+
+    errors, warns, scanned = 0, 0, 0
+    recent = []
+    last_error_at = ""
+
+    for raw in out.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        scanned += 1
+        stamp, message = _strip_timestamp(raw)
+        # Swarm prefixa cada linha com o id da task; só polui a tela.
+        message = re.sub(r"^\S+\.\d+\.\S+\s*\|\s*", "", message)
+
+        if error_re.search(message):
+            errors += 1
+            last_error_at = stamp or last_error_at
+            recent.append({"t": stamp, "lvl": "err", "m": message[:120]})
+        elif warn_re.search(message):
+            warns += 1
+            recent.append({"t": stamp, "lvl": "warn", "m": message[:120]})
+
+    # As mais novas primeiro: é o que interessa numa tela pequena.
+    recent.reverse()
+
+    return {
+        "scanned": scanned,
+        "errors": errors,
+        "warnings": warns,
+        "last_error_at": last_error_at,
+        "recent": recent[:12],
+    }
+
+
+def collect_service_tasks(name, timeout):
+    """Histórico de tasks do serviço — revela reinícios e crash loops."""
+    out = run(["docker", "service", "ps", name, "--no-trunc",
+               "--format", "{{json .}}"], timeout)
+    if out is None:
+        return None
+
+    running, failed, last_error = 0, 0, ""
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        state = (raw.get("CurrentState") or "")
+        if state.startswith("Running"):
+            running += 1
+        elif state.startswith(("Failed", "Rejected")):
+            failed += 1
+            if not last_error:
+                last_error = (raw.get("Error") or "")[:120]
+
+    return {"running_tasks": running, "failed_tasks": failed,
+            "last_task_error": last_error}
+
+
+def collect_focus(name, cfg, timeout, docker):
+    """Visão detalhada de um único serviço: réplicas, tasks e anomalias."""
+    swarm = bool(docker) and docker.get("mode") == "swarm"
+
+    replicas, state_ok = "?", None
+    for entry in (docker or {}).get("containers", []):
+        if entry.get("name") == name:
+            replicas = entry.get("replicas") or entry.get("state", "?")
+            state_ok = entry.get("ok")
+            break
+
+    logs = collect_service_logs(name, cfg, timeout, swarm=swarm)
+    tasks = collect_service_tasks(name, timeout) if swarm else None
+
+    errors = (logs or {}).get("errors", 0)
+    failed_tasks = (tasks or {}).get("failed_tasks", 0)
+
+    if state_ok is False:
+        status = "down"
+    elif errors > 0 or failed_tasks > 0:
+        status = "degraded"
+    elif state_ok is None:
+        status = "unknown"
+    else:
+        status = "ok"
+
+    return {
+        "name": name,
+        "status": status,
+        "replicas": replicas,
+        "logs": logs,
+        "tasks": tasks,
+    }
+
+
 def collect_containers(watch, timeout):
     """Swarm quando disponivel, senao containers avulsos."""
     swarm = collect_swarm(watch, timeout)
@@ -485,10 +657,23 @@ class Collector(threading.Thread):
         else:
             status = "ok"
 
+        # Serviços com tela dedicada. Coletados aqui junto do resto para que o
+        # HTTP continue respondendo de cache, sem disparar `docker logs` a
+        # cada requisição do ESP32.
+        focus = {}
+        for name in cfg.get("focus_services", []):
+            try:
+                focus[name] = collect_focus(name, cfg, timeout, docker)
+            except Exception as exc:
+                focus[name] = {"name": name, "status": "unknown",
+                               "replicas": "?", "logs": None, "tasks": None,
+                               "error": f"{type(exc).__name__}: {exc}"}
+
         return {
             "status": status,
             "ok": status == "ok",
             "ts": int(time.time()),
+            "focus": focus,
             "host": cfg["hostname_override"] or socket.gethostname(),
             "uptime_s": uptime,
             "agent_version": "1.0.0",
@@ -522,6 +707,30 @@ class Collector(threading.Thread):
     def get(self):
         with self.lock:
             return self.snapshot
+
+
+def summarize_focus(entry):
+    """Versão compacta da tela de serviço, com chaves curtas.
+
+    A tela do ESP32 mostra poucas linhas: mandamos 4 mensagens já cortadas em
+    vez do log inteiro, para o payload continuar cabendo com folga na RAM.
+    """
+    logs = entry.get("logs") or {}
+    tasks = entry.get("tasks") or {}
+    recent = logs.get("recent", [])[:4]
+    return {
+        "name": entry.get("name", "")[:28],
+        "st": entry.get("status", "unknown"),
+        "rep": entry.get("replicas", "?"),
+        "err": logs.get("errors", 0),
+        "wrn": logs.get("warnings", 0),
+        "scan": logs.get("scanned", 0),
+        "lerr": logs.get("last_error_at", ""),
+        "rt": tasks.get("running_tasks", 0),
+        "ft": tasks.get("failed_tasks", 0),
+        "msgs": [{"t": m.get("t", ""), "l": m.get("lvl", ""),
+                  "m": m.get("m", "")[:64]} for m in recent],
+    }
 
 
 def summarize(full):
@@ -616,8 +825,38 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, full)
         elif path == "/health/summary":
             self._send(200, summarize(full))
+        elif path in ("/service", "/service/summary"):
+            self._send_service(full, path.endswith("/summary"))
         else:
-            self._send(404, {"error": "not found", "paths": ["/health", "/health/summary", "/ping"]})
+            self._send(404, {"error": "not found",
+                             "paths": ["/health", "/health/summary",
+                                       "/service", "/service/summary",
+                                       "/ping"]})
+
+    def _send_service(self, full, compact):
+        """Detalhe de um serviço. Sem ?name=, devolve o primeiro configurado."""
+        focus = full.get("focus") or {}
+        query = self.path.split("?", 1)[1] if "?" in self.path else ""
+        wanted = ""
+        for part in query.split("&"):
+            key, _, value = part.partition("=")
+            if key == "name":
+                wanted = unquote_plus(value)
+
+        if not focus:
+            self._send(404, {"error": "nenhum focus_service configurado"})
+            return
+
+        # Só nomes já coletados — o que equivale à whitelist de focus_services.
+        # Sem isso, o parâmetro viraria leitura arbitrária de log.
+        if wanted and wanted not in focus:
+            self._send(404, {"error": "serviço não está em focus_services",
+                             "available": sorted(focus)})
+            return
+
+        name = wanted or sorted(focus)[0]
+        entry = focus[name]
+        self._send(200, summarize_focus(entry) if compact else entry)
 
 
 def main():

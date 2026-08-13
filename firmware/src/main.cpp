@@ -26,7 +26,7 @@
 // Rede de seguranca caso o arquivo exista mas esteja incompleto.
 #if !defined(WIFI_SSID) || !defined(HEALTH_URL) || !defined(HEALTH_TOKEN) ||   \
     !defined(RGB_R_PIN) || !defined(VERIFY_TLS) || !defined(ENABLE_WEB_UI) || \
-    !defined(ENABLE_DISPLAY)
+    !defined(ENABLE_DISPLAY) || !defined(ENABLE_FOCUS_SCREEN)
 #error "monitor_config.h esta incompleto — compare com monitor_config.example.h."
 #endif
 
@@ -349,6 +349,102 @@ static Status fetchHealth() {
 }
 
 // ---------------------------------------------------------------------------
+// Tela 2 — detalhe do serviço em foco
+// ---------------------------------------------------------------------------
+
+#if ENABLE_FOCUS_SCREEN
+// Consulta /service/summary. Falha aqui nao derruba a tela principal: o
+// painel geral continua valendo mesmo sem detalhe do servico.
+static void fetchFocus() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  const bool useTls = strncmp(FOCUS_URL, "https://", 8) == 0;
+  WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  HTTPClient http;
+
+  if (useTls) {
+#if VERIFY_TLS
+    if (!g_timeSynced) return;
+    secureClient.setCACert(HEALTH_CA_CERT);
+#else
+    secureClient.setInsecure();
+#endif
+    secureClient.setTimeout(HTTP_TIMEOUT_MS / 1000);
+  }
+
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+
+  const bool began = useTls ? http.begin(secureClient, FOCUS_URL)
+                            : http.begin(plainClient, FOCUS_URL);
+  if (!began) return;
+  http.addHeader("Authorization", "Bearer " HEALTH_TOKEN);
+  http.addHeader("Accept", "application/json");
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.printf("[foco] HTTP %d\n", code);
+    g_state.focus.valid = false;
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  JsonDocument doc;
+  if (deserializeJson(doc, payload)) {
+    g_state.focus.valid = false;
+    return;
+  }
+
+  Focus f;
+  f.valid = true;
+  strlcpy(f.name, doc["name"] | "?", sizeof(f.name));
+  strlcpy(f.replicas, doc["rep"] | "?", sizeof(f.replicas));
+  f.errors = doc["err"] | 0;
+  f.warnings = doc["wrn"] | 0;
+  f.scanned = doc["scan"] | 0;
+  f.runningTasks = doc["rt"] | 0;
+  f.failedTasks = doc["ft"] | 0;
+  f.lastErrorAt = String((const char *)(doc["lerr"] | ""));
+
+  const char *st = doc["st"] | "unknown";
+  if (strcmp(st, "ok") == 0) f.status = ST_OK;
+  else if (strcmp(st, "degraded") == 0) f.status = ST_DEGRADED;
+  else if (strcmp(st, "down") == 0) f.status = ST_DOWN;
+  else f.status = ST_FETCH_ERR;
+
+  f.lineCount = 0;
+  for (JsonVariantConst item : doc["msgs"].as<JsonArrayConst>()) {
+    if (f.lineCount >= 4) break;
+    LogLine &line = f.lines[f.lineCount++];
+    line.time = String((const char *)(item["t"] | ""));
+    line.level = String((const char *)(item["l"] | ""));
+    line.text = String((const char *)(item["m"] | ""));
+  }
+
+  g_state.focus = f;
+}
+
+static void printFocus() {
+  const Focus &f = g_state.focus;
+  if (!f.valid) return;
+  Serial.println();
+  Serial.printf("  [%s]  %s  replicas %s\n", f.name, statusName(f.status),
+                f.replicas);
+  Serial.printf("  erros %d | avisos %d | reinicios %d | %d linhas lidas\n",
+                f.errors, f.warnings, f.failedTasks, f.scanned);
+  for (int i = 0; i < f.lineCount; i++) {
+    Serial.printf("    %s %-4s %s\n", f.lines[i].time.c_str(),
+                  f.lines[i].level.c_str(), f.lines[i].text.c_str());
+  }
+}
+#endif  // ENABLE_FOCUS_SCREEN
+
+// ---------------------------------------------------------------------------
 // Log serial
 // ---------------------------------------------------------------------------
 
@@ -571,10 +667,29 @@ void loop() {
   server.handleClient();
 #endif
 
-  // Toque na tela força uma consulta imediata.
+  // Alternancia automatica entre os paineis.
+  static uint32_t lastSwitchMs = 0;
+#if ENABLE_FOCUS_SCREEN
+  if (millis() - lastSwitchMs > SCREEN_SWITCH_MS) {
+    lastSwitchMs = millis();
+    g_state.screen = g_state.screen == SCREEN_OVERVIEW ? SCREEN_FOCUS
+                                                       : SCREEN_OVERVIEW;
+  }
+#endif
+
+  // Toque troca de painel na hora e reinicia o relogio da alternancia —
+  // quem encostou na tela quer ver a outra agora, nao daqui a alguns segundos.
   if (displayTouchConsumed()) {
+#if ENABLE_FOCUS_SCREEN
+    g_state.screen = g_state.screen == SCREEN_OVERVIEW ? SCREEN_FOCUS
+                                                       : SCREEN_OVERVIEW;
+    lastSwitchMs = millis();
+    Serial.printf("[touch] painel: %s\n",
+                  g_state.screen == SCREEN_FOCUS ? "servico" : "geral");
+#else
     Serial.println("[touch] atualizacao forcada");
     g_lastAttemptMs = 0;
+#endif
   }
 
   // Reconexao de Wi-Fi.
@@ -630,9 +745,18 @@ void loop() {
     beep(BUZZER_BEEPS);
   }
 
+#if ENABLE_FOCUS_SCREEN
+  // Só busca o detalhe quando a leitura principal deu certo — sem rede, a
+  // segunda requisição só gastaria timeout.
+  if (statusHasVmData(next)) fetchFocus();
+#endif
+
   refreshDerived();
   displayRender(g_state);
   printDashboard();
+#if ENABLE_FOCUS_SCREEN
+  printFocus();
+#endif
 
   // Ultimo recurso: se a rede nunca voltar, reinicia a placa.
   if (g_state.failures >= MAX_FAILURES_BEFORE_REBOOT) {
