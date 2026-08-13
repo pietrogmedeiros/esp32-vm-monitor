@@ -136,10 +136,19 @@ class TestSwarm(unittest.TestCase):
         self.assertEqual(res["total"], 6)
 
     def test_servico_escalado_para_zero_nao_e_falha(self):
-        # 0/0 = desligado de proposito, nao quebrado.
-        entry = [c for c in self.collect([])["containers"]
-                 if c["name"] == "gob_desligado"][0]
+        # 0/0 = parado, nao quebrado. Sai em 'stopped', nao em 'bad'.
+        res = self.collect([])
+        entry = [c for c in res["containers"] if c["name"] == "gob_desligado"][0]
         self.assertTrue(entry["ok"])
+        self.assertTrue(entry["stopped"])
+        self.assertIn("gob_desligado", res["stopped"])
+        self.assertNotIn("gob_desligado", res["bad"])
+
+    def test_parado_e_diferente_de_zero_de_um(self):
+        res = self.collect([])
+        # 0/1 = deveria ter 1 replica e nao tem -> falha
+        self.assertIn("gob_shipsafe", res["bad"])
+        self.assertNotIn("gob_shipsafe", res["stopped"])
 
     def test_modo_global_conta_replicas(self):
         entry = [c for c in self.collect([])["containers"]
@@ -258,6 +267,62 @@ class TestStatus(unittest.TestCase):
     def test_coletores_ausentes_nao_quebram(self):
         res = self.build(None, None, None, 30.0, 40.0, 0.3)
         self.assertEqual(res["status"], "ok")
+
+
+class TestStoppedPolicy(unittest.TestCase):
+    """Serviços parados de propósito: quem decide a gravidade é o operador."""
+
+    DOCKER = {"mode": "swarm", "total": 3, "bad": [],
+              "stopped": ["gob_shipsafe"], "containers": []}
+
+    def build(self, policy):
+        cfg = json.loads(json.dumps(ha.DEFAULTS))
+        cfg["stopped_services"] = policy
+        collector = ha.Collector(cfg)
+        collector.cpu_percent = lambda: 10.0
+        patches = [
+            mock.patch.object(ha, "collect_memory",
+                              return_value={"used_pct": 30.0, "total_bytes": 1,
+                                            "used_bytes": 1,
+                                            "swap_total_bytes": 0,
+                                            "swap_used_pct": 0.0}),
+            mock.patch.object(ha, "collect_disks", return_value=[]),
+            mock.patch.object(ha, "collect_load", return_value=None),
+            mock.patch.object(ha, "collect_uptime", return_value=1),
+            mock.patch.object(ha, "collect_systemd", return_value=None),
+            mock.patch.object(ha, "collect_containers", return_value=self.DOCKER),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return collector.build()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_warning_degrada_sem_derrubar(self):
+        res = self.build("warning")
+        self.assertEqual(res["status"], "degraded")
+        self.assertIn("parado:gob_shipsafe", res["warnings"])
+        self.assertEqual(res["problems"], [])
+
+    def test_failure_derruba(self):
+        res = self.build("failure")
+        self.assertEqual(res["status"], "down")
+        self.assertIn("parado:gob_shipsafe", res["problems"])
+
+    def test_ignore_nao_reporta(self):
+        res = self.build("ignore")
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["warnings"], [])
+        self.assertEqual(res["problems"], [])
+
+    def test_resumo_nomeia_o_aviso_para_a_tela(self):
+        # "DEGRADADO" sem dizer o porquê não ajuda quem olha o ESP32.
+        s = ha.summarize(self.build("warning"))
+        self.assertEqual(s["st"], "degraded")
+        self.assertIn("parado:gob_shipsafe", s["bad"])
+        self.assertEqual(s["nbad"], 1)
 
 
 class TestSummary(unittest.TestCase):

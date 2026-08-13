@@ -40,6 +40,10 @@ DEFAULTS = {
     "watch_disks": ["/"],
     # Containers que DEVEM estar rodando. Vazio = observa todos os existentes.
     "watch_containers": [],
+    # O que fazer com servicos swarm em 0/0 (parados de proposito — no
+    # Easypanel e a bolinha vermelha). "failure" derruba o status, "warning"
+    # degrada, "ignore" nao reporta.
+    "stopped_services": "warning",
     "thresholds": {
         "cpu_pct": 90.0,
         "mem_pct": 90.0,
@@ -275,7 +279,7 @@ def collect_swarm(watch, timeout):
     if out is None:
         return None
 
-    services, bad = [], []
+    services, bad, stopped = [], [], []
     seen = set()
     for line in out.splitlines():
         line = line.strip()
@@ -298,8 +302,10 @@ def collect_swarm(watch, timeout):
         if watch and name not in watch:
             continue
 
-        # desired == 0 significa servico escalado para zero de proposito.
-        healthy = desired == 0 or running >= desired
+        # 0/0 nao e o mesmo que 0/1: o servico esta parado, nao caiu.
+        # Quem decide a gravidade disso e a config 'stopped_services'.
+        is_stopped = desired == 0
+        healthy = is_stopped or running >= desired
         entry = {
             "name": name,
             "image": raw.get("Image", ""),
@@ -307,22 +313,25 @@ def collect_swarm(watch, timeout):
             "replicas": replicas,
             "running": running,
             "desired": desired,
+            "stopped": is_stopped,
             "ok": healthy,
         }
         services.append(entry)
         if not healthy:
             bad.append(name)
+        elif is_stopped:
+            stopped.append(name)
 
     for name in watch:
         if name not in seen:
             services.append({
                 "name": name, "image": "", "mode": "", "replicas": "0/0",
-                "running": 0, "desired": 0, "ok": False,
+                "running": 0, "desired": 0, "stopped": False, "ok": False,
             })
             bad.append(name)
 
     return {"mode": "swarm", "total": len(services), "bad": bad,
-            "containers": services}
+            "stopped": stopped, "containers": services}
 
 
 def collect_docker(watch, timeout):
@@ -381,7 +390,7 @@ def collect_docker(watch, timeout):
             bad.append(name)
 
     return {"mode": "standalone", "total": len(containers), "bad": bad,
-            "containers": containers}
+            "stopped": [], "containers": containers}
 
 
 def collect_containers(watch, timeout):
@@ -441,10 +450,19 @@ class Collector(threading.Thread):
             problems += ["systemd:" + n for n in systemd["bad"]]
         if docker and docker["bad"]:
             problems += ["docker:" + n for n in docker["bad"]]
-        down = bool(problems)
 
         # Recursos estourados degradam, mas não derrubam.
         warnings = []
+
+        # Servicos parados de proposito: a gravidade e escolha do operador.
+        policy = cfg.get("stopped_services", "warning")
+        stopped = (docker or {}).get("stopped", [])
+        if stopped and policy == "failure":
+            problems += ["parado:" + n for n in stopped]
+        elif stopped and policy == "warning":
+            warnings += ["parado:" + n for n in stopped]
+
+        down = bool(problems)
         if cpu is not None and cpu >= thresholds["cpu_pct"]:
             warnings.append(f"cpu:{cpu}%")
         if memory and memory["used_pct"] >= thresholds["mem_pct"]:
@@ -510,7 +528,10 @@ def summarize(full):
     disks = full.get("disks") or []
     worst_disk = max((d["used_pct"] for d in disks), default=None)
 
-    problems = full.get("problems", [])
+    # A telinha do ESP32 mostra 'bad' literalmente. Avisos entram na lista
+    # junto com as falhas — o campo 'st' ja diferencia a gravidade, e um
+    # "DEGRADADO" sem dizer o porque nao ajuda ninguem.
+    issues = list(full.get("problems", [])) + list(full.get("warnings", []))
     return {
         "ok": full.get("ok", False),
         "st": full.get("status", "unknown"),
@@ -526,8 +547,8 @@ def summarize(full):
         "dkr": [docker.get("total", 0) if docker else 0,
                 len(docker.get("bad", [])) if docker else 0],
         # Limitado para caber com folga na RAM do ESP32.
-        "bad": [p[:40] for p in problems[:8]],
-        "nbad": len(problems),
+        "bad": [i[:40] for i in issues[:8]],
+        "nbad": len(issues),
     }
 
 
