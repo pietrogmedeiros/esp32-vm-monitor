@@ -444,9 +444,21 @@ def collect_docker(watch, timeout):
 # sinal numa tela de 3 linhas.
 DEFAULT_ERROR_RE = (
     r"(?i)(\bERROR\b|\bFATAL\b|\bCRITICAL\b|\bPANIC\b|\bException\b|"
-    r"\bTraceback\b|\bECONNREFUSED\b|\bUnhandled\b|\bsegfault\b)"
+    r"\bTraceback\b|\bECONNREFUSED\b|\bUnhandled\b|\bsegfault\b|"
+    r"\bForced shutdown\b|\bOOMKilled\b|\bout of memory\b)"
 )
-DEFAULT_WARN_RE = r"(?i)(\bWARN\b|\bWARNING\b|\bdeprecated\b|\bretrying\b)"
+DEFAULT_WARN_RE = (
+    r"(?i)(\bWARN\b|\bWARNING\b|\bdeprecated\b|\bretrying\b|"
+    r"\bSIGTERM\b|\bshutting down\b)"
+)
+
+# Muito backend não prefixa nível nenhum: o log é de acesso HTTP puro
+# ("GET /api/x 503 12.3 ms"). Sem isto, um serviço devolvendo 500 para todo
+# mundo apareceria como log limpo. O método e a rota antes do código evitam
+# casar com durações e outros números soltos da linha.
+HTTP_5XX_RE = re.compile(
+    r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+\S+\s+(5\d{2})\b"
+)
 
 # Prefixo ISO que o --timestamps do docker coloca em cada linha.
 _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})\S*\s+(.*)$")
@@ -487,7 +499,8 @@ def collect_service_logs(name, cfg, timeout, swarm=True):
         # Swarm prefixa cada linha com o id da task; só polui a tela.
         message = re.sub(r"^\S+\.\d+\.\S+\s*\|\s*", "", message)
 
-        if error_re.search(message):
+        http5xx = cfg.get("detect_http_5xx", True) and HTTP_5XX_RE.search(message)
+        if error_re.search(message) or http5xx:
             errors += 1
             last_error_at = stamp or last_error_at
             recent.append({"t": stamp, "lvl": "err", "m": message[:120]})

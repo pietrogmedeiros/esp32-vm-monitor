@@ -275,12 +275,69 @@ class TestServiceLogs(unittest.TestCase):
             res = ha.collect_service_logs("x", cfg, 5)
         self.assertEqual(res["errors"], 1)
 
+    def test_config_pode_desligar_deteccao_de_5xx(self):
+        cfg = dict(self.CFG, detect_http_5xx=False)
+        with mock.patch.object(ha, "run_merged", return_value=LOGS_OUT):
+            base = ha.collect_service_logs("x", cfg, 5)
+        self.assertEqual(base["errors"], 2)  # so os do regex textual
+
 
 TASKS_OUT = "\n".join(json.dumps(t) for t in [
     {"CurrentState": "Running 3 hours ago", "Error": ""},
     {"CurrentState": "Shutdown 2 days ago", "Error": ""},
     {"CurrentState": "Failed 2 days ago", "Error": "task: non-zero exit (1)"},
 ])
+
+
+# Linhas copiadas do log real do lemon-meet_backend rodando na VM.
+REAL_LOGS = "\n".join([
+    "2026-08-10T00:22:56.707Z b.1.x | [INFO] [CalendarCron] User 590a25d8 sem assinatura ativa",
+    "2026-08-10T00:22:57.000Z b.1.x | GET /api/meetings?limit=9999 304 1247.434 ms - -",
+    "2026-08-10T00:22:58.000Z b.1.x | GET /metrics 200 2.690 ms - -",
+    "2026-08-10T00:22:59.000Z b.1.x | GET /health 200 0.615 ms - 77",
+    "2026-08-10T00:23:00.000Z b.1.x | SIGTERM received, shutting down gracefully...",
+    "2026-08-10T00:23:40.088Z b.1.x | Forced shutdown after timeout",
+])
+
+
+class TestPadroesDoLogReal(unittest.TestCase):
+    """Os padrões precisam caber no formato que o backend realmente usa:
+    access log sem prefixo de nível."""
+
+    CFG = {"focus_log_lines": 300, "error_pattern": "", "warn_pattern": ""}
+
+    def collect(self, text):
+        with mock.patch.object(ha, "run_merged", return_value=text):
+            return ha.collect_service_logs("lemon-meet_backend", self.CFG, 5)
+
+    def test_forced_shutdown_e_erro(self):
+        res = self.collect(REAL_LOGS)
+        self.assertEqual(res["errors"], 1)
+        self.assertIn("Forced shutdown", res["recent"][0]["m"])
+
+    def test_sigterm_e_aviso(self):
+        res = self.collect(REAL_LOGS)
+        self.assertEqual(res["warnings"], 1)
+
+    def test_status_2xx_3xx_nao_alarma(self):
+        # 304 e 200 sao trafego normal; e o 1247.434 ms nao pode virar "5xx".
+        res = self.collect(REAL_LOGS)
+        textos = " ".join(m["m"] for m in res["recent"])
+        self.assertNotIn("/api/meetings", textos)
+        self.assertNotIn("/metrics", textos)
+
+    def test_http_5xx_vira_erro(self):
+        log = "2026-08-10T00:00:00Z b | POST /api/rooms 503 8.2 ms - -"
+        self.assertEqual(self.collect(log)["errors"], 1)
+
+    def test_duracao_parecida_com_5xx_nao_alarma(self):
+        # "500" aqui e a duracao, nao o status: o status e 200.
+        log = "2026-08-10T00:00:00Z b | GET /api/x 200 500 ms - -"
+        self.assertEqual(self.collect(log)["errors"], 0)
+
+    def test_numero_solto_nao_alarma(self):
+        log = "2026-08-10T00:00:00Z b | processados 502 registros"
+        self.assertEqual(self.collect(log)["errors"], 0)
 
 
 class TestServiceTasks(unittest.TestCase):
